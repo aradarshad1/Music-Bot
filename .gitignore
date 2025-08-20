@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+
+# Virtual environment
+.venv/
+
+# Environment variables
+.env
+
+# Audio files (don’t commit user voices or temp conversions)
+*.ogg
+*.mp3
+*.wav
+
+# Logs
+*.log
+
+# VSCode / IDE
+.vscode/
+.idea/
