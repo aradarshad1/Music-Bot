@@ -4,6 +4,7 @@ import logging
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 from pydub import AudioSegment
+from yt_dlp import YoutubeDL
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -102,6 +103,40 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(reply)
     logger.info("Replied to user.")
 
+# ---------------- Instagram handler ----------------
+
+async def handle_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message or not message.text:
+        return
+
+    url = message.text.strip()
+    if "instagram.com" not in url:
+        return  # ignore non-IG links
+
+    await message.reply_text("📥 Downloading Instagram video...")
+
+    try:
+        ydl_opts = {
+            "format": "mp4",
+            "outtmpl": "insta.%(ext)s",
+            "quiet": True,
+        }
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            video_path = ydl.prepare_filename(info)
+
+        # Send back video
+        with open(video_path, "rb") as f:
+            await message.reply_video(f)
+
+        # Cleanup
+        os.remove(video_path)
+
+    except Exception as e:
+        logger.error("Instagram download failed: %s", e)
+        await message.reply_text("⚠️ Failed to download the Instagram video.")
+
 
 # ---------------- Start command ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,6 +154,7 @@ def main():
         filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE | filters.Document.AUDIO,
         handle_media
     ))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("instagram.com"), handle_instagram))
 
     # Debug catch-all (remove later)
     app.add_handler(MessageHandler(filters.ALL, debug_all))
@@ -127,6 +163,9 @@ def main():
 
     print("Bot is running...")
     app.run_polling()
+
+
+
 
 if __name__ == "__main__":
     main()
