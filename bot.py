@@ -9,6 +9,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+ydl_opts = {
+    "format": "mp4",
+    "outtmpl": "video.%(ext)s",
+    "cookiefile": r"C:\Users\Wee App 144\Desktop\Music-Bot\cookies.txt",  
+    "quiet": False
+}
+
 # Load environment variables
 ALLOWED_CHATS = os.getenv("ALLOWED_CHATS", "").split(",") if os.getenv("ALLOWED_CHATS") else []
 FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg")
@@ -103,39 +111,66 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(reply)
     logger.info("Replied to user.")
 
-# ---------------- Instagram handler ----------------
-
-async def handle_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------- Link handler ----------------
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
         return
 
     url = message.text.strip()
-    if "instagram.com" not in url:
-        return  # ignore non-IG links
+    if not any(domain in url for domain in ["instagram.com", "youtu.be", "youtube.com"]):
+        return
 
-    await message.reply_text("📥 Downloading Instagram video...")
+    await message.reply_text("📥 Downloading video...")
 
     try:
         ydl_opts = {
-            "format": "mp4",
-            "outtmpl": "insta.%(ext)s",
+            "format": "bestvideo[ext=mp4][filesize<50M]+bestaudio[ext=m4a]/best[filesize<50M]",
+            "outtmpl": "download.%(ext)s",
             "quiet": True,
         }
+
+        # If cookies.txt exists, use it
+        if not os.path.exists("cookies.txt"):
+            await message.reply_text("⚠️ YouTube requires login. Please export cookies.txt from your browser and place it in the bot folder.")
+            return
+
+
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             video_path = ydl.prepare_filename(info)
 
-        # Send back video
         with open(video_path, "rb") as f:
             await message.reply_video(f)
 
-        # Cleanup
         os.remove(video_path)
 
     except Exception as e:
-        logger.error("Instagram download failed: %s", e)
-        await message.reply_text("⚠️ Failed to download the Instagram video.")
+        logger.error("Video download failed: %s", e)
+        await message.reply_text("⚠️ Video failed. Trying audio...")
+
+        try:
+            ydl_opts_audio = {
+                "format": "bestaudio/best",
+                "outtmpl": "download.%(ext)s",
+                "quiet": True,
+            }
+            if os.path.exists("cookies.txt"):
+                ydl_opts_audio["cookiefile"] = "cookies.txt"
+
+            with YoutubeDL(ydl_opts_audio) as ydl:
+                info = ydl.extract_info(url, download=True)
+                audio_path = ydl.prepare_filename(info)
+
+            with open(audio_path, "rb") as f:
+                await message.reply_audio(f)
+
+            os.remove(audio_path)
+
+        except Exception as e2:
+            logger.error("Audio download failed: %s", e2)
+            await message.reply_text("⚠️ Couldn’t download this video or audio.")
+
 
 
 # ---------------- Start command ----------------
@@ -150,11 +185,10 @@ def main():
     app.add_handler(CommandHandler("start", start))
 
     # Media handler
-    app.add_handler(MessageHandler(
-        filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE | filters.Document.AUDIO,
-        handle_media
-    ))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("instagram.com"), handle_instagram))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE | filters.Document.AUDIO,handle_media))
+
+    # Instagram and YouTube link handler
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("(instagram.com|youtu.be|youtube.com)"),handle_link))
 
     # Debug catch-all (remove later)
     app.add_handler(MessageHandler(filters.ALL, debug_all))
