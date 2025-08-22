@@ -118,7 +118,9 @@ Show download progress in real-time
 Upload the media file to Telegram
 Fallback to audio if video fails
 
-!!!ATTENTION: At the moment youtube downloader is currently unavailalbe for fixing itt on next versions!!!
+#-----------------------------------------------------------------------------------------------------------#
+**!!!ATTENTION: At the moment youtube downloader is currently unavailalbe for fixing itt on next versions!!!**
+#-----------------------------------------------------------------------------------------------------------#
 
 🤖 Commands
 
