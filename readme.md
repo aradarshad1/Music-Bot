@@ -1,9 +1,6 @@
 🎵📥 Telegram Media Bot
-A powerful Telegram bot that combines music recognition and media downloading capabilities. Send voice messages to identify songs, or paste links to download videos and audio from popular platforms.
-Show Image
-Show Image
-Show Image
-✨ Features
+A powerful and simple  Telegram bot that combines music recognition and media downloading capabilities. Send voice messages to identify songs, or paste links to download videos and audio from popular platforms.
+✨ Features:
 🎵 Music Recognition
 
 Voice Message Recognition - Send voice notes to identify songs
@@ -12,7 +9,7 @@ Video Note Processing - Extract audio from Telegram video notes
 Multiple Streaming Links - Get links to Spotify, Apple Music, Deezer
 Fast Processing - Optimized audio conversion and API calls
 
-📥 Media Downloader
+📥 Media Downloader:
 
 YouTube Support - Download videos, shorts, and audio
 Instagram Integration - Download posts, reels, and stories
@@ -21,7 +18,7 @@ Real-time Progress - Live progress bars in Telegram
 Smart Fallback - Auto-switches to audio if video fails
 File Size Management - Automatic compression for large files
 
-🛠️ Technical Features
+🛠️ Technical Features:
 
 Async Processing - Non-blocking operations for better performance
 Error Recovery - Robust error handling and retry mechanisms
@@ -29,7 +26,7 @@ Resource Management - Automatic cleanup of temporary files
 Rate Limiting - Respects API limits and Telegram restrictions
 Cross-platform - Works on Windows, Linux, and macOS
 
-🚀 Quick Start
+🚀 Quick Start:
 Prerequisites
 
 Python 3.8 or higher
