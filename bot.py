@@ -9,6 +9,8 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes, Com
 from pydub import AudioSegment
 from yt_dlp import YoutubeDL
 from dotenv import load_dotenv
+import tempfile
+import shutil
 
 load_dotenv()
 
@@ -19,7 +21,7 @@ if not os.path.exists("downloads"):
 # Load environment variables
 ALLOWED_CHATS = os.getenv("ALLOWED_CHATS", "").split(",") if os.getenv("ALLOWED_CHATS") else []
 FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg")
-MAX_SECONDS = int(os.getenv("MAX_SECONDS", 18))
+MAX_SECONDS = int(os.getenv("MAX_SECONDS", 30))  # Increased for better recognition
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 AUDD_API_TOKEN = os.getenv("AUDD_API_TOKEN")
 
@@ -28,211 +30,313 @@ if not TELEGRAM_TOKEN or not AUDD_API_TOKEN:
 
 if ALLOWED_CHATS:
     try:
-        ALLOWED_CHATS = [int(chat_id.strip()) for chat_id in ALLOWED_CHATS if chat_id.strip().isdigit()]
+        ALLOWED_CHATS = [int(chat_id.strip()) for chat_id in ALLOWED_CHATS if chat_id.strip().lstrip('-').isdigit()]
     except ValueError:
         raise ValueError("ALLOWED_CHATS must be a comma-separated list of valid chat IDs.")
-    
+
+# Test FFmpeg availability
 try:
     AudioSegment.converter = FFMPEG_BINARY
     AudioSegment.ffmpeg = FFMPEG_BINARY
     AudioSegment.ffprobe = FFMPEG_BINARY.replace("ffmpeg", "ffprobe")
-except OSError:
-    raise ValueError(f"FFMPEG not found at {FFMPEG_BINARY}. Please install it or set the correct path in .env.")
+    # Test with a dummy conversion
+    test_audio = AudioSegment.silent(duration=100)  # 100ms of silence
+    test_audio.export("test.mp3", format="mp3")
+    if os.path.exists("test.mp3"):
+        os.remove("test.mp3")
+    print("✅ FFmpeg is working correctly")
+except Exception as e:
+    print(f"❌ FFmpeg test failed: {e}")
+    raise ValueError(f"FFMPEG not working properly. Error: {e}")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # ---------------- Error handler ----------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling update:", exc_info=context.error)
     if update and isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text("⚠️ An error occurred, please try again later.")
+        try:
+            await update.effective_message.reply_text("⚠️ An error occurred, please try again later.")
+        except Exception as e:
+            logger.error(f"Failed to send error message: {e}")
 
 # ---------------- Debug catch-all ----------------
 async def debug_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("📩 Raw update: %s", update.to_dict())
 
-# ---------------- Media handler (FIXED) ----------------
+# ---------------- Improved Audio Processing ----------------
+def process_audio_for_recognition(input_path: str, output_path: str) -> bool:
+    """
+    Process audio file for better music recognition.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        # Load audio
+        audio = AudioSegment.from_file(input_path)
+        
+        # Limit duration but take from the middle for better recognition
+        duration_ms = len(audio)
+        max_duration_ms = MAX_SECONDS * 1000
+        
+        if duration_ms > max_duration_ms:
+            # Take from the middle of the track (often has the chorus)
+            start_time = (duration_ms - max_duration_ms) // 2
+            audio = audio[start_time:start_time + max_duration_ms]
+            logger.info(f"Trimmed audio from {duration_ms}ms to {len(audio)}ms (middle section)")
+        
+        # Optimize for recognition
+        # Normalize volume
+        audio = audio.normalize()
+        
+        # Convert to mono (music recognition works better with mono)
+        if audio.channels > 1:
+            audio = audio.set_channels(1)
+            logger.info("Converted to mono")
+        
+        # Set optimal sample rate for music recognition (44.1kHz or 22kHz)
+        if audio.frame_rate != 44100:
+            audio = audio.set_frame_rate(44100)
+            logger.info(f"Resampled to 44.1kHz")
+        
+        # Export with optimal settings for recognition
+        audio.export(
+            output_path,
+            format="mp3",
+            bitrate="192k",  # Higher bitrate for better quality
+            parameters=["-ac", "1", "-ar", "44100"]  # Force mono, 44.1kHz
+        )
+        
+        logger.info(f"Audio processed successfully: {output_path}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Audio processing failed: {e}")
+        return False
+
+# ---------------- Enhanced Media handler ----------------
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message:
         return
 
-    logger.info("Got a message of type: %s", type(message))
+    # Check if it's an allowed chat
+    if ALLOWED_CHATS and message.chat_id not in ALLOWED_CHATS:
+        logger.info(f"Blocked request from unauthorized chat: {message.chat_id}")
+        await message.reply_text("⚠️ This bot is restricted to authorized chats only.")
+        return
+
+    logger.info(f"Processing media from chat {message.chat_id}, message type: {type(message)}")
     
     # Send initial status
     status_msg = await message.reply_text("🎵 Processing your audio...")
 
-    try:
-        # Get the file based on message type
-        if message.voice:
-            file = await message.voice.get_file()
-            ext = ".ogg"
-            file_name = "voice"
-        elif message.audio:
-            file = await message.audio.get_file()
-            ext = ".mp3"
+    # Use temporary directory for better file management
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            # Get the file based on message type
+            file = None
+            ext = None
             file_name = "audio"
-        elif message.video_note:
-            file = await message.video_note.get_file()
-            ext = ".mp4"
-            file_name = "video_note"
-        elif message.document and message.document.mime_type and message.document.mime_type.startswith("audio/"):
-            file = await message.document.get_file()
-            # Get extension from mime type or filename
-            if message.document.file_name:
-                ext = os.path.splitext(message.document.file_name)[1] or ".mp3"
-            else:
+            
+            if message.voice:
+                file = await message.voice.get_file()
+                ext = ".ogg"
+                file_name = "voice"
+                logger.info("Processing voice message")
+            elif message.audio:
+                file = await message.audio.get_file()
                 ext = ".mp3"
-            file_name = "document"
-        else:
-            await status_msg.edit_text("⚠️ Please send me a voice note, audio file, or video note.")
-            return
-
-        # Create unique filename to avoid conflicts
-        unique_id = uuid.uuid4().hex[:8]
-        original_path = f"downloads/{file_name}_{unique_id}{ext}"
-        mp3_path = f"downloads/{file_name}_{unique_id}.mp3"
-
-        # Download the file
-        await status_msg.edit_text("📥 Downloading audio file...")
-        await file.download_to_drive(original_path)
-        logger.info("Downloaded to %s", original_path)
-
-        # Convert to mp3 if needed
-        await status_msg.edit_text("🔄 Converting audio format...")
-        try:
-            if ext.lower() != ".mp3":
-                sound = AudioSegment.from_file(original_path)
-                # Limit duration to save processing time and API costs
-                if len(sound) > MAX_SECONDS * 1000:
-                    sound = sound[:MAX_SECONDS * 1000]
-                sound.export(mp3_path, format="mp3", bitrate="128k")
-                logger.info("Converted to mp3: %s", mp3_path)
-                
-                # Close the AudioSegment to release file handle
-                del sound
-                await asyncio.sleep(0.1)  # Small delay to ensure file is released
-                
-                # Clean up original file
-                try:
-                    if os.path.exists(original_path):
-                        os.remove(original_path)
-                except PermissionError:
-                    logger.warning("Could not delete original file, will try later")
-                    
-                audio_file_path = mp3_path
-            else:
-                audio_file_path = original_path
-        except Exception as e:
-            logger.error("Audio conversion failed: %s", e)
-            await status_msg.edit_text("⚠️ Failed to process audio file. Please try a different format.")
-            # Clean up files with better error handling
-            await asyncio.sleep(0.5)  # Wait a bit before cleanup
-            for path in [original_path, mp3_path]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except (PermissionError, OSError) as cleanup_error:
-                        logger.warning("Could not delete file %s: %s", path, cleanup_error)
-            return
-
-        # Send to AudD API
-        await status_msg.edit_text("🔍 Recognizing song...")
-        try:
-            with open(audio_file_path, "rb") as f:
-                response = requests.post(
-                    "https://api.audd.io/",
-                    data={
-                        "api_token": AUDD_API_TOKEN, 
-                        "return": "apple_music,spotify,deezer,napster"
-                    },
-                    files={"file": f},
-                    timeout=30  # Add timeout
-                )
-            
-            logger.info("AudD status: %s", response.status_code)
-            
-            if response.status_code != 200:
-                raise Exception(f"AudD API returned status {response.status_code}")
-                
-            result = response.json()
-            logger.info("AudD response: %s", result)
-
-            # Parse the result
-            if result.get("status") == "success" and result.get("result"):
-                song = result["result"]
-                title = song.get("title", "Unknown Title")
-                artist = song.get("artist", "Unknown Artist")
-                album = song.get("album", "")
-                
-                reply = f"🎵 **{title}** — **{artist}**"
-                if album:
-                    reply += f"\n💿 Album: {album}"
-                
-                # Add streaming links
-                links_added = False
-                if song.get("spotify") and song["spotify"].get("external_urls", {}).get("spotify"):
-                    reply += f"\n🎧 [Spotify]({song['spotify']['external_urls']['spotify']})"
-                    links_added = True
-                    
-                if song.get("apple_music") and song["apple_music"].get("url"):
-                    reply += f"\n🍎 [Apple Music]({song['apple_music']['url']})"
-                    links_added = True
-                    
-                if song.get("deezer") and song["deezer"].get("link"):
-                    reply += f"\n🎼 [Deezer]({song['deezer']['link']})"
-                    links_added = True
-                
-                if not links_added:
-                    reply += f"\n\n🔍 Search: `{title} {artist}`"
-                    
-            else:
-                # Check for specific error messages
-                if result.get("error"):
-                    error_msg = result["error"].get("error_message", "Unknown error")
-                    reply = f"😅 Recognition failed: {error_msg}"
+                file_name = "audio"
+                logger.info(f"Processing audio file: {message.audio.title or 'unknown'}")
+            elif message.video_note:
+                file = await message.video_note.get_file()
+                ext = ".mp4"
+                file_name = "video_note"
+                logger.info("Processing video note")
+            elif message.document and message.document.mime_type:
+                if message.document.mime_type.startswith("audio/"):
+                    file = await message.document.get_file()
+                    if message.document.file_name:
+                        ext = os.path.splitext(message.document.file_name)[1] or ".mp3"
+                    else:
+                        ext = ".mp3"
+                    file_name = "document"
+                    logger.info(f"Processing audio document: {message.document.file_name or 'unknown'}")
                 else:
-                    reply = "😅 Sorry, I couldn't recognize that song. Try with a clearer audio or a more popular track."
+                    await status_msg.edit_text("⚠️ Please send an audio file, not a document.")
+                    return
+            else:
+                await status_msg.edit_text("⚠️ Please send me a voice note, audio file, video note, or audio document.")
+                return
 
-        except requests.RequestException as e:
-            logger.error("AudD API request failed: %s", e)
-            reply = "⚠️ Music recognition service is temporarily unavailable. Please try again later."
+            if not file:
+                await status_msg.edit_text("⚠️ Could not access the file. Please try again.")
+                return
+
+            # Create unique filename
+            unique_id = uuid.uuid4().hex[:8]
+            original_path = os.path.join(temp_dir, f"{file_name}_{unique_id}{ext}")
+            processed_path = os.path.join(temp_dir, f"{file_name}_{unique_id}_processed.mp3")
+
+            # Download the file
+            await status_msg.edit_text("📥 Downloading audio file...")
+            await file.download_to_drive(original_path)
+            logger.info(f"Downloaded {file.file_size} bytes to {original_path}")
+
+            # Process audio for recognition
+            await status_msg.edit_text("🔄 Processing audio for recognition...")
+            if not process_audio_for_recognition(original_path, processed_path):
+                await status_msg.edit_text("⚠️ Failed to process audio file. Please try a different format.")
+                return
+
+            # Check if processed file exists and has reasonable size
+            if not os.path.exists(processed_path):
+                await status_msg.edit_text("⚠️ Audio processing failed. Please try again.")
+                return
+
+            file_size = os.path.getsize(processed_path)
+            if file_size < 1024:  # Less than 1KB is probably an error
+                await status_msg.edit_text("⚠️ Processed audio file is too small. Please try a longer audio clip.")
+                return
+
+            logger.info(f"Processed audio size: {file_size} bytes")
+
+            # Send to AudD API
+            await status_msg.edit_text("🔍 Recognizing song... (this may take a moment)")
+            
+            try:
+                with open(processed_path, "rb") as f:
+                    # Prepare the request
+                    files = {"file": f}
+                    data = {
+                        "api_token": AUDD_API_TOKEN, 
+                        "return": "apple_music,spotify,deezer,napster,lyrics"  # Added lyrics
+                    }
+                    
+                    logger.info("Sending request to AudD API...")
+                    response = requests.post(
+                        "https://api.audd.io/",
+                        data=data,
+                        files=files,
+                        timeout=45  # Increased timeout
+                    )
+                
+                logger.info(f"AudD API response - Status: {response.status_code}")
+                
+                if response.status_code == 429:
+                    await status_msg.edit_text("⚠️ Too many requests. Please wait a moment and try again.")
+                    return
+                elif response.status_code != 200:
+                    logger.error(f"AudD API error: {response.status_code} - {response.text}")
+                    await status_msg.edit_text(f"⚠️ Music recognition service error (HTTP {response.status_code}). Please try again later.")
+                    return
+                    
+                result = response.json()
+                logger.info(f"AudD response: {result}")
+
+                # Parse the result
+                if result.get("status") == "success":
+                    if result.get("result"):
+                        song = result["result"]
+                        title = song.get("title", "Unknown Title")
+                        artist = song.get("artist", "Unknown Artist")
+                        album = song.get("album", "")
+                        release_date = song.get("release_date", "")
+                        
+                        # Format the response
+                        reply = f"🎵 **{title}**\n👨‍🎤 **{artist}**"
+                        
+                        if album:
+                            reply += f"\n💿 Album: *{album}*"
+                        if release_date:
+                            reply += f"\n📅 Released: {release_date}"
+                        
+                        # Add streaming links if available
+                        links = []
+                        
+                        if song.get("spotify") and song["spotify"].get("external_urls", {}).get("spotify"):
+                            links.append(f"🎧 [Spotify]({song['spotify']['external_urls']['spotify']})")
+                            
+                        if song.get("apple_music") and song["apple_music"].get("url"):
+                            links.append(f"🍎 [Apple Music]({song['apple_music']['url']})")
+                            
+                        if song.get("deezer") and song["deezer"].get("link"):
+                            links.append(f"🎼 [Deezer]({song['deezer']['link']})")
+                        
+                        if links:
+                            reply += "\n\n" + "\n".join(links)
+                        else:
+                            reply += f"\n\n🔍 Search: `{title} {artist}`"
+                            
+                    else:
+                        reply = ("😅 **Song not recognized**\n\n"
+                                "💡 **Tips for better recognition:**\n"
+                                "• Use a clearer/longer audio clip\n"
+                                "• Try popular songs\n"
+                                "• Avoid background noise\n"
+                                "• Send the chorus part if possible")
+                else:
+                    # Handle API errors
+                    error_info = result.get("error", {})
+                    if isinstance(error_info, dict):
+                        error_msg = error_info.get("error_message", "Unknown error")
+                        error_code = error_info.get("error_code", "N/A")
+                        
+                        if "insufficient" in error_msg.lower() or "limit" in error_msg.lower():
+                            reply = "⚠️ **API limit reached**\n\nThe music recognition service has reached its daily limit. Please try again tomorrow."
+                        elif "invalid" in error_msg.lower():
+                            reply = "⚠️ **Invalid audio format**\n\nPlease try with a different audio file."
+                        else:
+                            reply = f"❌ **Recognition failed**\n\nError: {error_msg} (Code: {error_code})"
+                    else:
+                        reply = f"❌ **Recognition failed**\n\nAPI returned an error. Please try again later."
+
+            except requests.exceptions.Timeout:
+                logger.error("AudD API request timed out")
+                reply = "⏰ **Request timed out**\n\nThe recognition service is taking too long. Please try again with a shorter audio clip."
+            except requests.exceptions.ConnectionError:
+                logger.error("AudD API connection failed")
+                reply = "🌐 **Connection failed**\n\nCannot connect to the music recognition service. Please check your internet connection and try again."
+            except requests.exceptions.RequestException as e:
+                logger.error(f"AudD API request failed: {e}")
+                reply = "⚠️ **Service unavailable**\n\nThe music recognition service is temporarily unavailable. Please try again later."
+            except ValueError as e:  # JSON decode error
+                logger.error(f"AudD API returned invalid JSON: {e}")
+                reply = "⚠️ **Invalid response**\n\nThe music recognition service returned an invalid response. Please try again."
+            except Exception as e:
+                logger.error(f"Unexpected error during music recognition: {e}")
+                reply = "😅 **Recognition failed**\n\nSomething went wrong. Please try again with a different audio file."
+
+            # Send the result
+            try:
+                await status_msg.edit_text(reply, parse_mode='Markdown', disable_web_page_preview=True)
+                logger.info("Successfully sent recognition result to user")
+            except Exception as e:
+                logger.error(f"Failed to send result: {e}")
+                # Fallback without markdown
+                await status_msg.edit_text(reply.replace("*", "").replace("**", ""), disable_web_page_preview=True)
+
         except Exception as e:
-            logger.error("Music recognition failed: %s", e)
-            reply = "😅 Sorry, I couldn't recognize that song. Please try again with a different audio file."
-
-        # Send the result
-        await status_msg.edit_text(reply, parse_mode='Markdown')
-        logger.info("Replied to user with result")
-
-    except Exception as e:
-        logger.error("Media handling failed: %s", e)
-        await status_msg.edit_text("⚠️ Failed to process your audio. Please try again.")
-    
-    finally:
-        # Clean up downloaded files with better error handling
-        await asyncio.sleep(0.5)  # Give time for file handles to be released
-        for path in [original_path if 'original_path' in locals() else None, 
-                    mp3_path if 'mp3_path' in locals() else None]:
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                    logger.info("Cleaned up file: %s", path)
-                except (PermissionError, OSError) as e:
-                    logger.warning("Could not delete file %s: %s. Will try again later.", path, e)
-                    # Try again after a longer delay
-                    try:
-                        await asyncio.sleep(1.0)
-                        os.remove(path)
-                        logger.info("Successfully cleaned up file on second attempt: %s", path)
-                    except:
-                        logger.error("Could not delete file %s even on second attempt", path)
+            logger.error(f"Media handling failed: {e}", exc_info=True)
+            try:
+                await status_msg.edit_text("⚠️ **Processing failed**\n\nSomething went wrong while processing your audio. Please try again.")
+            except:
+                pass
 
 # ---------------- Enhanced Link handler with better progress ----------------
 async def handle_link_simple_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
+        return
+
+    # Check if it's an allowed chat
+    if ALLOWED_CHATS and message.chat_id not in ALLOWED_CHATS:
+        logger.info(f"Blocked link request from unauthorized chat: {message.chat_id}")
+        await message.reply_text("⚠️ This bot is restricted to authorized chats only.")
         return
 
     url = message.text.strip()
@@ -496,7 +600,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• YouTube\n"
         "• Instagram\n"
         "• TikTok\n\n"
-        "Just paste the link and I'll download it for you! 🚀"
+        "Just paste the link and I'll download it for you! 🚀\n\n"
+        "💡 **Tips for better music recognition:**\n"
+        "• Use clear audio without background noise\n"
+        "• Send the chorus part if possible\n"
+        "• Longer clips work better (up to 30 seconds)"
     )
     await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
@@ -506,19 +614,38 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🆘 **Help & Commands**\n\n"
         "**📱 Supported Media:**\n"
         "• Voice messages\n"
-        "• Audio files (MP3, M4A, etc.)\n"
+        "• Audio files (MP3, M4A, OGG, etc.)\n"
         "• Video notes\n"
         "• Audio documents\n\n"
         "**🔗 Supported Platforms:**\n"
         "• YouTube (videos & shorts)\n"
         "• Instagram (posts, reels, stories)\n"
         "• TikTok\n\n"
-        "**💡 Tips:**\n"
-        "• For better recognition, use clear audio\n"
-        "• Private content might not be downloadable\n"
-        "• Large files are automatically compressed"
+        "**💡 Tips for Music Recognition:**\n"
+        "• Use clear, high-quality audio\n"
+        "• Avoid background noise\n"
+        "• Send popular/well-known songs\n"
+        "• Include the chorus if possible\n"
+        "• Try different parts of the song\n\n"
+        "**🛠 Troubleshooting:**\n"
+        "• If recognition fails, try a longer clip\n"
+        "• Ensure the audio is clear and loud\n"
+        "• Try popular songs for better results"
     )
     await update.message.reply_text(help_text, parse_mode='Markdown')
+
+# ---------------- Status command (for debugging) ----------------
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status_text = (
+        "🤖 **Bot Status**\n\n"
+        f"✅ Bot is running\n"
+        f"🎵 Music Recognition: {'✅ Enabled' if AUDD_API_TOKEN else '❌ No API token'}\n"
+        f"📥 Media Downloader: ✅ Enabled\n"
+        f"🔧 FFmpeg: ✅ Working\n"
+        f"⏱ Max audio duration: {MAX_SECONDS} seconds\n"
+        f"🔐 Chat restrictions: {'✅ Enabled' if ALLOWED_CHATS else '❌ Disabled (public)'}"
+    )
+    await update.message.reply_text(status_text, parse_mode='Markdown')
 
 # ---------------- Main ----------------
 def main():
@@ -527,6 +654,7 @@ def main():
     # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE | filters.Document.AUDIO, handle_media))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("(instagram.com|youtu.be|youtube.com|tiktok.com)"), handle_link_simple_progress))
     app.add_handler(MessageHandler(filters.ALL, debug_all))
@@ -535,6 +663,8 @@ def main():
     print("🤖 Bot is running...")
     print("📱 Music recognition enabled")
     print("📥 Media downloader enabled")
+    print(f"🔐 Chat restrictions: {'Enabled' if ALLOWED_CHATS else 'Disabled (public)'}")
+    print(f"⏱ Max audio duration: {MAX_SECONDS} seconds")
     app.run_polling()
 
 if __name__ == "__main__":
